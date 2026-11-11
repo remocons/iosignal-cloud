@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A · 송신자</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <h1>A · 송신자</h1>
+  <p class="sub">수신자 B에서 시작 버튼을 누르면 여기서 시그널을 보냅니다. 이 탭은 열어둔 채로 두세요.</p>
+  <div class="panel status"><span><span class="dot" id="dot"></span><span id="conn">연결 중…</span></span></div>
+  <div class="panel"><pre class="log" id="log"></pre></div>
+</main>
+<script src="/lib/io.js"></script>
+<script src="/protocol.js"></script>
+<script src="/sender-core.js"></script>
+<script>
+  const logEl = document.getElementById('log');
+  const log = (m) => { logEl.textContent = `${new Date().toLocaleTimeString()}  ${m}\n` + logEl.textContent; };
+  const io = new IO(BenchProtocol.wsUrl(location));
+  io.on('ready', () => { document.getElementById('dot').classList.add('on'); document.getElementById('conn').textContent = '서버 연결됨'; });
+  io.on('close', () => { document.getElementById('dot').classList.remove('on'); document.getElementById('conn').textContent = '연결 끊김 · 재연결 시도 중'; });
+  io.on('error', (e) => log('오류: ' + (e?.message || e)));
+  createSender(io, BenchProtocol, log);
+</script>
+</body>
+</html>

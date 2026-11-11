@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iosignal 전송 벤치마크</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <h1>iosignal 1KB 신호 전송 시각화</h1>
+  <p class="sub">송신자 A가 1KB 시그널을 연속으로 보내면, 수신자 B가 도착한 조각을 전송 시간에 따른 색으로 화면에 쌓습니다.</p>
+  <div class="cards">
+    <a href="/sender.html" target="_blank"><div class="panel"><h1>A · 송신자</h1><p class="sub">B의 시작 명령을 받아 시그널을 전송합니다. 이 탭을 먼저 열어두세요.</p></div></a>
+    <a href="/receiver.html"><div class="panel"><h1>B · 수신자</h1><p class="sub">시작 버튼, 조각 보드, 통계를 보여줍니다.</p></div></a>
+  </div>
+  <p class="note">송신자는 브라우저 대신 터미널에서 <code>npm run sender</code>로도 실행할 수 있습니다.</p>
+</main>
+</body>
+</html>
