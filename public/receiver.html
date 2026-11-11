@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B · 수신자</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <h1>B · 수신자</h1>
+  <p class="sub">시작을 누르면 송신자 A가 시그널을 보냅니다. 도착한 조각은 전송 시간이 짧을수록 파란색, 길수록 붉은색으로 칠해집니다.</p>
+
+  <div class="panel">
+    <div class="row">
+      <label>신호 개수<input id="count" type="number" min="1" max="100000" value="1000"></label>
+      <label>신호 크기 (바이트)<input id="size" type="number" min="24" max="1048576" value="1024"></label>
+      <label>전송 간격 (ms, 0=연속)<input id="interval" type="number" min="0" step="0.5" value="0"></label>
+      <button id="start" disabled>시작</button>
+    </div>
+    <div class="status" style="margin-top:12px">
+      <span><span class="dot" id="srvDot"></span><span id="srv">서버 연결 중…</span></span>
+      <span><span class="dot" id="sndDot"></span><span id="snd">송신자 A 찾는 중…</span></span>
+    </div>
+  </div>
+
+  <div class="panel board">
+    <canvas id="board" width="800" height="500" aria-label="수신된 조각 보드"></canvas>
+    <div class="legend">
+      <span id="lgMin">빠름</span><div class="bar" id="lgBar"></div><span id="lgMax">느림</span>
+    </div>
+    <div class="progress" id="progress">대기 중</div>
+  </div>
+
+  <div class="panel hidden" id="statsPanel">
+    <div class="stats" id="stats"></div>
+    <p class="note" id="statsNote"></p>
+  </div>
+</main>
+
+<script src="/lib/io.js"></script>
+<script src="/protocol.js"></script>
+<script>
+const P = BenchProtocol;
+const $ = (id) => document.getElementById(id);
+
+// ---------- 색상 스케일: 빠름(파랑) → 느림(빨강) ----------
+const STOPS = ['#2f6bff', '#22b8ee', '#2fd39a', '#c9d93a', '#ffa53d', '#ff4d5e'].map(h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)));
+function colorAt(t) {
+  t = Math.min(1, Math.max(0, t)) * (STOPS.length - 1);
+  const i = Math.min(STOPS.length - 2, Math.floor(t)), f = t - i, a = STOPS[i], b = STOPS[i + 1];
+  return `rgb(${a.map((v, k) => Math.round(v + (b[k] - v) * f)).join(',')})`;
+}
+$('lgBar').style.background = `linear-gradient(90deg, ${STOPS.map((_, i) => colorAt(i / (STOPS.length - 1))).join(',')})`;
+
+// ---------- 상태 ----------
+let run = null;          // 현재 측정
+let senderSeenAt = 0;
+let gap = 1;             // 0..1, 조각 사이 틈 (완료되면 0으로 줄어들며 하나의 네모가 됨)
+let dirty = true;
+
+function newRun(count, size, interval) {
+  const cols = Math.ceil(Math.sqrt(count * 1.6));
+  return {
+    id: (Math.random() * 0xffffffff) >>> 0,
+    count, size, interval, cols, rows: Math.ceil(count / cols),
+    lat: new Float64Array(count).fill(NaN),
+    arrival: new Uint32Array(count),   // 도착 순번
+    received: 0, dup: 0, corrupt: 0, outOfOrder: 0, maxSeq: -1, bytes: 0,
+    firstSend: Infinity, firstRecv: 0, lastRecv: 0, startedAt: P.now(),
+    minLat: Infinity, maxLat: -Infinity, senderSendMs: null, finished: false, timer: 0,
+  };
+}
+
+// ---------- 그리기 ----------
+const cv = $('board'), ctx = cv.getContext('2d');
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth || 800;
+  cv.width = Math.round(w * dpr); cv.height = Math.round(w * 0.625 * dpr); dirty = true;
+}
+window.addEventListener('resize', resizeCanvas);
+
+function layout(r) {
+  const W = cv.width, H = cv.height;
+  const cell = Math.min(W / r.cols, H / r.rows);
+  return { cell, ox: (W - cell * r.cols) / 2, oy: (H - cell * r.rows) / 2 };
+}
+
+function draw() {
+  requestAnimationFrame(draw);
+  if (!dirty) return;
+  dirty = false;
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  if (!run) return;
+  const { cell, ox, oy } = layout(run);
+  const g = Math.min(cell * 0.18, 3 * (window.devicePixelRatio || 1)) * gap;
+  const span = run.maxLat - run.minLat;
+  // 빈 칸(아직 안 온 조각)
+  ctx.fillStyle = '#1d2230';
+  for (let s = 0; s < run.count; s++) {
+    if (!Number.isNaN(run.lat[s])) continue;
+    const x = ox + (s % run.cols) * cell, y = oy + Math.floor(s / run.cols) * cell;
+    ctx.fillRect(x + g / 2, y + g / 2, cell - g, cell - g);
+  }
+  // 도착한 조각: 전송 시간에 따라 색
+  for (let s = 0; s < run.count; s++) {
+    const l = run.lat[s];
+    if (Number.isNaN(l)) continue;
+    const x = ox + (s % run.cols) * cell, y = oy + Math.floor(s / run.cols) * cell;
+    ctx.fillStyle = colorAt(span > 0 ? (l - run.minLat) / span : 0);
+    // 완료 후 틈이 사라질 때 이웃과 겹치게 살짝 키워 이음새를 없앤다
+    const pad = gap === 0 ? 0.5 : 0;
+    ctx.fillRect(x + g / 2 - pad, y + g / 2 - pad, cell - g + pad * 2, cell - g + pad * 2);
+  }
+}
+
+function mergeAnimation() {
+  const t0 = performance.now(), dur = 700;
+  const step = (now) => {
+    const k = Math.min(1, (now - t0) / dur);
+    gap = 1 - (1 - Math.pow(1 - k, 3));
+    if (k >= 1) gap = 0;
+    dirty = true;
+    if (k < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+// ---------- 수신 ----------
+function onData(bytes) {
+  const now = P.now();
+  const r = run;
+  if (!r || r.finished) return;
+  const p = P.decode(bytes);
+  if (!p || p.runId !== r.id || p.seq >= r.count) return;
+  if (!p.intact) { r.corrupt++; return; }
+  if (!Number.isNaN(r.lat[p.seq])) { r.dup++; return; }
+  const l = now - p.sendTime;
+  r.lat[p.seq] = l;
+  r.arrival[p.seq] = r.received;
+  if (p.seq < r.maxSeq) r.outOfOrder++; else r.maxSeq = p.seq;
+  if (!r.received) r.firstRecv = now;
+  r.received++; r.bytes += p.bytes; r.lastRecv = now;
+  r.firstSend = Math.min(r.firstSend, p.sendTime);
+  if (l < r.minLat) r.minLat = l;
+  if (l > r.maxLat) r.maxLat = l;
+  dirty = true;
+  updateProgress();
+  if (r.received === r.count) finish('complete');
+  else armIdleTimer();
+}
+
+function armIdleTimer() {
+  clearTimeout(run.timer);
+  // 마지막 수신 후 3초(첫 수신 전에는 5초) 동안 더 오지 않으면 손실로 보고 종료
+  run.timer = setTimeout(() => finish('timeout'), run.received ? 3000 : 5000);
+}
+
+function updateProgress() {
+  const r = run;
+  $('progress').textContent = `${r.received.toLocaleString()} / ${r.count.toLocaleString()} 조각 수신` +
+    (r.received ? ` · 전송 시간 ${fmt(r.minLat)} ~ ${fmt(r.maxLat)} ms` : '');
+  if (r.received) { $('lgMin').textContent = `${fmt(r.minLat)} ms`; $('lgMax').textContent = `${fmt(r.maxLat)} ms`; }
+}
+
+const fmt = (v, d) => {
+  if (!Number.isFinite(v)) return '-';
+  const a = Math.abs(v);
+  return v.toFixed(d ?? (a >= 100 ? 0 : a >= 10 ? 1 : 2));
+};
+
+function finish(reason) {
+  const r = run;
+  if (!r || r.finished) return;
+  r.finished = true;
+  r.reason = reason;
+  clearTimeout(r.timer);
+  $('start').disabled = false;
+  $('start').textContent = '다시 시작';
+  updateProgress();
+  if (reason === 'complete') mergeAnimation();
+  showStats(r, reason);
+}
+
+function percentile(sorted, q) {
+  if (!sorted.length) return NaN;
+  const i = (sorted.length - 1) * q, lo = Math.floor(i), hi = Math.ceil(i);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (i - lo);
+}
+
+function showStats(r, reason) {
+  const lats = Array.from(r.lat).filter(v => !Number.isNaN(v)).sort((a, b) => a - b);
+  const n = lats.length;
+  const avg = n ? lats.reduce((a, b) => a + b, 0) / n : NaN;
+  const sd = n ? Math.sqrt(lats.reduce((a, b) => a + (b - avg) ** 2, 0) / n) : NaN;
+  const totalMs = r.received ? r.lastRecv - r.firstSend : NaN;   // 첫 송신 ~ 마지막 수신
+  const recvMs = r.received ? r.lastRecv - r.firstRecv : NaN;    // 첫 수신 ~ 마지막 수신
+  const lost = r.count - r.received;
+  const items = [
+    ['수신', `${r.received.toLocaleString()}<small>/ ${r.count.toLocaleString()}</small>`],
+    ['손실', lost.toLocaleString(), lost > 0],
+    ['순서 뒤바뀜', r.outOfOrder.toLocaleString(), r.outOfOrder > 0],
+    ['손상 / 중복', `${r.corrupt} / ${r.dup}`, r.corrupt + r.dup > 0],
+    ['총 소요 시간', `${fmt(totalMs)}<small>ms</small>`],
+    ['처리량', `${fmt(r.bytes / 1024 / (totalMs / 1000), 0)}<small>KB/s</small>`],
+    ['초당 메시지', `${fmt(r.received / (totalMs / 1000), 0)}<small>msg/s</small>`],
+    ['전송 시간 최소', `${fmt(lats[0])}<small>ms</small>`],
+    ['평균', `${fmt(avg)}<small>ms</small>`],
+    ['중앙값 (p50)', `${fmt(percentile(lats, 0.5))}<small>ms</small>`],
+    ['p95', `${fmt(percentile(lats, 0.95))}<small>ms</small>`],
+    ['p99', `${fmt(percentile(lats, 0.99))}<small>ms</small>`],
+    ['최대', `${fmt(lats[n - 1])}<small>ms</small>`],
+    ['표준편차 (지터)', `${fmt(sd)}<small>ms</small>`],
+    ['수신 구간', `${fmt(recvMs)}<small>ms</small>`],
+    ['A 송신 소요', r.senderSendMs == null ? '-' : `${fmt(r.senderSendMs)}<small>ms</small>`],
+  ];
+  $('stats').innerHTML = items.map(([k, v, bad]) => `<div class="stat${bad ? ' bad' : ''}"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+  const notes = [];
+  notes.push(reason === 'complete' ? '모든 조각이 도착했습니다.' : `마지막 수신 후 응답이 없어 종료했습니다. ${lost.toLocaleString()}개가 도착하지 않았습니다.`);
+  notes.push(`전송 시간 = B 수신 시각 − A 송신 시각 (${r.size}B × ${r.count}개, 간격 ${r.interval}ms).`);
+  if (lats[0] < 0) notes.push('음수 값이 있습니다: A와 B가 서로 다른 기기라 시계가 어긋난 것으로 보입니다. 색은 상대적인 차이로 칠해집니다.');
+  $('statsNote').textContent = notes.join(' ');
+  $('statsPanel').classList.remove('hidden');
+}
+
+// ---------- 툴팁: 조각에 마우스를 올리면 전송 시간 표시 ----------
+cv.addEventListener('mousemove', (e) => {
+  if (!run) return;
+  const rect = cv.getBoundingClientRect(), k = cv.width / rect.width;
+  const { cell, ox, oy } = layout(run);
+  const c = Math.floor(((e.clientX - rect.left) * k - ox) / cell), rw = Math.floor(((e.clientY - rect.top) * k - oy) / cell);
+  const s = rw * run.cols + c;
+  if (c < 0 || c >= run.cols || rw < 0 || s >= run.count) { cv.title = ''; return; }
+  const l = run.lat[s];
+  cv.title = Number.isNaN(l) ? `#${s + 1}: 미수신` : `#${s + 1}: ${fmt(l)} ms (${run.arrival[s] + 1}번째 도착)`;
+});
+
+// ---------- 연결 ----------
+const io = new IO(P.wsUrl(location));
+io.on('error', (e) => console.error(e));
+io.on('ready', () => {
+  $('srvDot').classList.add('on'); $('srv').textContent = '서버 연결됨';
+  io.subscribe(P.TAG_DATA);
+  io.subscribe(P.TAG_STATE);
+  io.signal(P.TAG_CTRL, { cmd: 'ping' });
+  $('start').disabled = !!(run && !run.finished);
+});
+io.on('close', () => { $('srvDot').classList.remove('on'); $('srv').textContent = '연결 끊김 · 재연결 시도 중'; $('start').disabled = true; });
+io.on('message', (tag, msg) => {
+  if (tag === P.TAG_DATA) return onData(msg);
+  if (tag === P.TAG_STATE && msg && typeof msg === 'object') {
+    senderSeenAt = Date.now(); updateSender();
+    if (msg.state === 'done' && run && msg.runId === run.id) {
+      run.senderSendMs = msg.sendMs;
+      if (run.finished) showStats(run, run.reason);
+    }
+  }
+});
+
+function updateSender() {
+  const on = Date.now() - senderSeenAt < 6000;
+  $('sndDot').classList.toggle('on', on);
+  $('snd').innerHTML = on ? '송신자 A 연결됨' : '송신자 A 없음 · <a href="/sender.html" target="_blank">송신자 페이지 열기</a> 또는 <code>npm run sender</code>';
+}
+setInterval(() => { io.signal(P.TAG_CTRL, { cmd: 'ping' }); }, 2000);
+setInterval(updateSender, 1000);
+
+$('start').addEventListener('click', () => {
+  const count = Math.max(1, Math.min(100000, parseInt($('count').value) || 1000));
+  const size = Math.max(P.HEADER, Math.min(1048576, parseInt($('size').value) || 1024));
+  const interval = Math.max(0, parseFloat($('interval').value) || 0);
+  if (run) clearTimeout(run.timer);
+  run = newRun(count, size, interval);
+  gap = 1; dirty = true;
+  $('statsPanel').classList.add('hidden');
+  $('lgMin').textContent = '빠름'; $('lgMax').textContent = '느림';
+  $('start').disabled = true; $('start').textContent = '수신 중…';
+  updateProgress();
+  armIdleTimer();
+  io.signal(P.TAG_CTRL, { cmd: 'start', runId: run.id, count, size, interval });
+});
+
+resizeCanvas();
+updateSender();
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>

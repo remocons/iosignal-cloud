@@ -1,0 +1,25 @@
+{
+  "name": "iosignal-cloud",
+  "version": "1.0.0",
+  "description": "iosignal 1KB 신호 전송 시각화 벤치마크",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "sender": "node sender.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/remocons/iosignal-cloud.git"
+  },
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/remocons/iosignal-cloud/issues"
+  },
+  "homepage": "https://github.com/remocons/iosignal-cloud#readme",
+  "dependencies": {
+    "iosignal": "^9.12.0"
+  },
+  "type": "module",
+  "private": true
+}
